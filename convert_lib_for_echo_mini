@@ -1,0 +1,231 @@
+#!/bin/python
+
+import os
+from os.path import join, getmtime
+import sys
+import shutil
+import threading
+import queue
+import subprocess
+import mutagen
+
+class FileToConvert:
+    def __init__(self, rel_path, source, dest):
+        self.path = join(source, rel_path)
+
+        file_mg = mutagen.File(self.path, easy=True)
+        self.artist = file_mg["albumartist"][0]
+        self.album = file_mg["album"][0]
+        self.track = file_mg["tracknumber"][0]
+        self.title = file_mg["title"][0]
+
+        disc = file_mg.get("discnumber")
+        if disc:
+            disc = int(disc[0].split("/")[0])
+            album_path, filename = os.path.split(rel_path)
+            artist, album = os.path.split(album_path)
+            album = f"{disc:02} {album}"
+            rel_path = join(artist, album, filename)
+
+            self.album = f"{disc:02} {self.album}"
+
+        self.dest_path = replace_ext(join(dest, rel_path), "mp3")
+
+    def write_dest_tags(self):
+        dest_mg = mutagen.easyid3.EasyID3(self.dest_path)
+        dest_mg.delete()
+        dest_mg["albumartist"] = self.artist
+        dest_mg["album"] = self.album
+        dest_mg["tracknumber"] = self.track
+        dest_mg["title"] = self.title
+        dest_mg.save()
+
+def ensure_dot_prefix(s):
+    if s[0] == ".":
+        return s
+    else:
+        return "." + s
+
+def dir_empty(dirpath):
+    try:
+        first = next(os.scandir(dirpath))
+    except StopIteration:
+        return True
+    return False
+
+def user_confirm():
+    inp = ""
+    while not (inp == "y" or inp == "n"):
+        inp = input("Begin? (y/N):")
+        inp = inp.lower()
+        inp = inp or "n"
+    return inp == "y"
+
+def replace_ext(fp, ext):
+    ext = ensure_dot_prefix(ext)
+    return os.path.splitext(fp)[0] + ext
+
+def ext(fp):
+    return os.path.splitext(fp)[1]
+
+def worker(q, args, stdout_lock):
+    while True:
+        f = q.get()
+
+        convert_cmd = [
+            "ffmpeg",
+            "-i", f.path,
+            "-y",                     # overwrite
+            "-vn",                    # strip video or image data
+            "-map_metadata", "0:s:0", # strip tags
+            "-acodec", "mp3",
+            "-b:a", "128k",           # constant bitrate
+            f.dest_path
+        ]
+
+        with stdout_lock:
+            print("Converting:", f.path, sep="")
+        os.makedirs(os.path.split(f.dest_path)[0], exist_ok=True)
+        proc = subprocess.run(
+            convert_cmd,
+            encoding="utf-8",
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        if proc.returncode != 0 or args.verbose:
+            with stdout_lock:
+                print(proc.stdout)
+
+        f.write_dest_tags()
+
+        q.task_done()
+
+def get_all_filepaths(start_path, ignore_exts=[], relative=True):
+    return [
+        os.path.relpath(join(dirpath, f), start_path) if relative else join(dirpath, f)
+        for dirpath, dirnames, filenames in os.walk(start_path)
+        for f in filenames
+        if ext(f) not in ignore_exts
+    ]
+
+def operations_to_sync(args):
+    create, delete = ([], [])
+    src_fps = []
+    for rel_path in get_all_filepaths(args.SOURCE, args.ignore_exts):
+        try:
+            src_fps.append(FileToConvert(rel_path, args.SOURCE, args.DEST))
+        except KeyError as e:
+            print(f"Error: Missing '{e.args[0]}' tag from '{join(args.SOURCE, rel_path)}'")
+            exit()
+        except TypeError:
+            print(f"Error: Failed to access tag info for '{join(args.SOURCE, rel_path)}'")
+            exit()
+    src_fps.sort(key=lambda f: f.dest_path)
+    dest_fps = get_all_filepaths(args.DEST, relative=False)
+    dest_fps.sort()
+
+    len_src_fps = len(src_fps)
+    src_i = 0
+    len_dest_fps = len(dest_fps)
+    dest_i = 0
+
+    while src_i < len_src_fps and dest_i < len_dest_fps:
+        src_fp = src_fps[src_i]
+        dest_fp = dest_fps[dest_i]
+
+        # src and dest both present
+        if src_fp.dest_path == dest_fp: 
+            if getmtime(src_fp.path) > getmtime(src_fp.dest_path):
+                create.append(src_fp)
+            src_i += 1
+            dest_i += 1
+        # dest file not present in src
+        elif src_fp.dest_path > dest_fp:
+            delete.append(dest_fp)
+            dest_i += 1
+        # src file not present dest
+        else:
+            create.append(src_fp)
+            src_i += 1
+
+    # leftover src files
+    for src_fp in src_fps[src_i:]:
+        create.append(src_fp)
+    # leftover dest files
+    for dest_fp in dest_fps[dest_i:]:
+        delete.append(dest_fp)
+
+    return (create, delete)
+
+def main(args):
+    if args.jobs <= 0:
+        args.jobs += os.cpu_count()
+    if args.jobs <= 0:
+        args.jobs = 1
+
+    if args.ignore_exts:
+        args.ignore_exts = [ensure_dot_prefix(e) for e in args.ignore_exts.split(",")]
+    else:
+        args.ignore_exts = []
+
+    print("Planning operations...")
+
+    files_to_convert, files_to_delete = operations_to_sync(args)
+
+    if 0 == len(files_to_convert) == len(files_to_delete):
+        print("No operations to perform")
+        return
+
+    for f in files_to_delete:
+        print("delete :", f, sep="")
+    for f in files_to_convert:
+        print("convert:", f.path, sep="")
+
+    if (not args.noconfirm) and (not user_confirm()):
+        return
+
+    print("-----SYNCING-----")
+
+    for fp in files_to_delete:
+        print("Removing:", fp, sep="")
+        os.remove(fp)
+        dir = os.path.split(fp)[0]
+        if dir_empty(dir):
+            os.removedirs(dir)
+
+    q = queue.Queue()
+    stdout_lock = threading.Lock()
+
+    threads = [
+        threading.Thread(
+            target=worker, args=(q, args, stdout_lock), daemon=True
+        )
+        for i in range(args.jobs)
+    ]
+    for thread in threads:
+        thread.start()
+
+    try:
+        for f in files_to_convert:
+            q.put(f)
+
+        q.join()
+    except:
+        with stdout_lock:
+            print("Interrupted")
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-j", "--jobs", default=0, type=int, help="How many threads to use, or if negative how many threads not to use from the max.")
+    parser.add_argument("--noconfirm", action="store_true")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("-i", "--ignore-exts", help="Comma separated list of file extensions, used to skip converting certain files.")
+    parser.add_argument("SOURCE", help="Path to your library.")
+    parser.add_argument("DEST", help="Path where the echo mini is mounted.")
+
+    args = parser.parse_args()
+
+    main(args)
