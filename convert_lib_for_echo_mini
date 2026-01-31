@@ -4,10 +4,10 @@ import os
 from os.path import join, getmtime
 import sys
 import shutil
-import threading
-import queue
+import multiprocessing
 import subprocess
 import mutagen
+from mutagen.easyid3 import EasyID3
 
 class FileToConvert:
     def __init__(self, rel_path, source, dest):
@@ -32,7 +32,7 @@ class FileToConvert:
         self.dest_path = replace_ext(join(dest, rel_path), "mp3")
 
     def write_dest_tags(self):
-        dest_mg = mutagen.easyid3.EasyID3(self.dest_path)
+        dest_mg = EasyID3(self.dest_path)
         dest_mg.delete()
         dest_mg["albumartist"] = self.artist
         dest_mg["album"] = self.album
@@ -194,11 +194,11 @@ def main(args):
         if dir_empty(dir):
             os.removedirs(dir)
 
-    q = queue.Queue()
-    stdout_lock = threading.Lock()
+    q = multiprocessing.JoinableQueue()
+    stdout_lock = multiprocessing.Lock()
 
     threads = [
-        threading.Thread(
+        multiprocessing.Process(
             target=worker, args=(q, args, stdout_lock), daemon=True
         )
         for i in range(args.jobs)
