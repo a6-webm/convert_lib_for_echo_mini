@@ -79,7 +79,7 @@ def worker(q, args, stdout_lock):
             "-vn",                    # strip video or image data
             "-map_metadata", "0:s:0", # strip tags
             "-acodec", "mp3",
-            "-b:a", "128k",           # constant bitrate
+            "-b:a", "192k",           # constant bitrate
             f.dest_path
         ]
 
