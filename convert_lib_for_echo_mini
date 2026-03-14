@@ -24,10 +24,10 @@ class FileToConvert:
             disc = int(disc[0].split("/")[0])
             album_path, filename = os.path.split(rel_path)
             artist, album = os.path.split(album_path)
-            album = f"{disc:02} {album}"
+            album = f"{album} {disc:02}"
             rel_path = join(artist, album, filename)
 
-            self.album = f"{disc:02} {self.album}"
+            self.album = f"{self.album} {disc:02}"
 
         self.dest_path = replace_ext(join(dest, rel_path), "mp3")
 
